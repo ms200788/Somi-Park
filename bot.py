@@ -562,8 +562,12 @@ async def cmd_start(message: types.Message):
         args = message.get_args().strip()
         payload = args if args else None
 
+        # prefer stored image + text if available
         start_text = db_get("start_text", "Welcome, {first_name}!")
+        # replace placeholders
         start_text = start_text.replace("{username}", message.from_user.username or "").replace("{first_name}", message.from_user.first_name or "")
+        start_image = db_get("start_image")
+
         optional_json = db_get("optional_channels", "[]")
         forced_json = db_get("force_channels", "[]")
         try:
@@ -577,9 +581,18 @@ async def cmd_start(message: types.Message):
         kb = build_channel_buttons(optional, forced)
 
         if not payload:
-            await message.answer(start_text, reply_markup=kb)
+            # if an image is set for start, send it with caption, else text
+            if start_image:
+                try:
+                    await bot.send_photo(message.chat.id, start_image, caption=start_text)
+                except Exception:
+                    # fallback to text-only
+                    await message.answer(start_text, reply_markup=kb)
+            else:
+                await message.answer(start_text, reply_markup=kb)
             return
 
+        # payload may be numeric id or token
         s = None
         try:
             sid = int(payload)
@@ -885,24 +898,6 @@ async def cmd_setmessage(message: types.Message):
     # If nothing matched, instruct usage
     await message.reply("Usage:\nReply to a message and use `/setmessage start` or `/setmessage help`\nOr reply and use `/setmessage` then reply with `start` or `help`.", parse_mode=None)
 
-# Handler to catch the follow-up word 'start' or 'help' when pending_setmessage exists
-@dp.message_handler(lambda m: m.from_user.id == OWNER_ID and m.text and m.text.strip().lower() in ("start", "help"))
-async def _finalize_pending_setmessage(m: types.Message):
-    key = m.from_user.id
-    if key not in pending_setmessage:
-        return  # not part of pending flow
-    choice = m.text.strip().lower()
-    data = pending_setmessage.pop(key, None)
-    if not data:
-        await m.reply("Pending data missing.", parse_mode=None)
-        return
-    txt = data.get("text", "")
-    if not txt:
-        await m.reply("No text available to set.", parse_mode=None)
-        return
-    db_set(f"{choice}_text", txt)
-    await m.reply(f"{choice} message updated.", parse_mode=None)
-
 @dp.message_handler(commands=["setimage"])
 async def cmd_setimage(message: types.Message):
     """
@@ -923,47 +918,37 @@ async def cmd_setimage(message: types.Message):
         rt = message.reply_to_message
         # Determine file_id from various media types
         file_id = None
-        try:
-            if getattr(rt, "photo", None):
-                # choose highest-res photo
-                file_id = rt.photo[-1].file_id
-            elif getattr(rt, "document", None):
-                file_id = rt.document.file_id
-            elif getattr(rt, "sticker", None):
-                file_id = rt.sticker.file_id
-            elif getattr(rt, "animation", None):
-                file_id = rt.animation.file_id
-        except Exception:
-            file_id = None
-
-        if not file_id:
+        if getattr(rt, "photo", None):
+            file_id = rt.photo[-1].file_id
+        elif getattr(rt, "document", None):
+            file_id = rt.document.file_id
+        elif getattr(rt, "sticker", None):
+            file_id = rt.sticker.file_id
+        elif getattr(rt, "animation", None):
+            file_id = rt.animation.file_id
+        else:
             await message.reply("Replied message must contain a photo, document (image), sticker, or animation.", parse_mode=None)
             return
-
-        # Save to settings
-        try:
+        if file_id:
             db_set(f"{target}_image", file_id)
             await message.reply(f"{target} image set.", parse_mode=None)
-        except Exception:
-            logger.exception("Failed to set image in DB")
-            await message.reply("Failed to save image.", parse_mode=None)
-        return
+            return
+        else:
+            await message.reply("Could not determine file to save.", parse_mode=None)
+            return
 
     # If replied but no target provided, store pending and ask for target
     if message.reply_to_message and not args_raw:
         rt = message.reply_to_message
         file_id = None
-        try:
-            if getattr(rt, "photo", None):
-                file_id = rt.photo[-1].file_id
-            elif getattr(rt, "document", None):
-                file_id = rt.document.file_id
-            elif getattr(rt, "sticker", None):
-                file_id = rt.sticker.file_id
-            elif getattr(rt, "animation", None):
-                file_id = rt.animation.file_id
-        except Exception:
-            file_id = None
+        if getattr(rt, "photo", None):
+            file_id = rt.photo[-1].file_id
+        elif getattr(rt, "document", None):
+            file_id = rt.document.file_id
+        elif getattr(rt, "sticker", None):
+            file_id = rt.sticker.file_id
+        elif getattr(rt, "animation", None):
+            file_id = rt.animation.file_id
 
         if not file_id:
             await message.reply("Replied message must contain a photo, document (image), sticker, or animation.", parse_mode=None)
@@ -986,28 +971,44 @@ async def cmd_setimage(message: types.Message):
 
     await message.reply("Usage:\nReply to a photo/document/sticker/animation and use `/setimage start` or `/setimage help`\nOr reply and use `/setimage` then reply with `start` or `help`.", parse_mode=None)
 
-# Handler to catch the follow-up word 'start' or 'help' when pending_setimage exists
+# Combined follow-up handler for pending_setimage and pending_setmessage
+# Priority: if a pending image exists for the owner, handle it first; else handle pending message.
 @dp.message_handler(lambda m: m.from_user.id == OWNER_ID and m.text and m.text.strip().lower() in ("start", "help"))
-async def _finalize_pending_setimage(m: types.Message):
+async def _finalize_pending_flows(m: types.Message):
     key = m.from_user.id
-    # If no pending image, return (this handler also used by pending_setmessage)
-    if key not in pending_setimage:
-        return
     choice = m.text.strip().lower()
-    data = pending_setimage.pop(key, None)
-    if not data:
-        await m.reply("Pending media missing.", parse_mode=None)
-        return
-    file_id = data.get("file_id")
-    if not file_id:
-        await m.reply("No media available to set.", parse_mode=None)
-        return
-    try:
+
+    # First, handle pending image if exists
+    if key in pending_setimage:
+        data = pending_setimage.pop(key, None)
+        if not data:
+            await m.reply("Pending media missing.", parse_mode=None)
+            return
+        file_id = data.get("file_id")
+        if not file_id:
+            await m.reply("No media available to set.", parse_mode=None)
+            return
         db_set(f"{choice}_image", file_id)
         await m.reply(f"{choice} image updated.", parse_mode=None)
-    except Exception:
-        logger.exception("Failed to save pending image to DB")
-        await m.reply("Failed to save image.", parse_mode=None)
+        return
+
+    # Next, handle pending message if exists
+    if key in pending_setmessage:
+        data = pending_setmessage.pop(key, None)
+        if not data:
+            await m.reply("Pending text missing.", parse_mode=None)
+            return
+        txt = data.get("text", "")
+        if not txt:
+            await m.reply("No text available to set.", parse_mode=None)
+            return
+        db_set(f"{choice}_text", txt)
+        await m.reply(f"{choice} message updated.", parse_mode=None)
+        return
+
+    # If nothing pending, ignore (or optionally notify)
+    # We silently return here to avoid interfering with other flows.
+    return
 
 @dp.message_handler(commands=["setchannel"])
 async def cmd_setchannel(message: types.Message):
