@@ -2,8 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.sqlite3
-/data
+*.db
+*.log
 .env
-.vscode
-.idea
+.vscode/
+.idea/
+*.mp4
+*.jpg
+*.jpeg
+*.png
