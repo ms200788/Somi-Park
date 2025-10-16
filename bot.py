@@ -1,24 +1,22 @@
 import os
 import asyncio
 import logging
-import math
 import time
-from typing import Dict, List
 from functools import wraps
-from dotenv import load_dotenv
-
+from typing import Dict, List
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InputFile, InputMediaVideo
+from aiogram.types import InputFile
 from aiogram.utils.executor import start_webhook
+from dotenv import load_dotenv
 
 # ------------------ Load environment ------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # e.g. https://your-app-name.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # https://your-app-name.onrender.com
 PORT = int(os.getenv("PORT", 10000))
-WEBHOOK_PATH = f"/webhook"
+WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 # ------------------ Logging ------------------
@@ -33,13 +31,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
 # ------------------ In-memory storage ------------------
-SESSIONS: Dict[int, Dict] = {}  # user_id -> session
-APPROVED_USERS: List[int] = [OWNER_ID]  # initially only owner
-VIDEO_QUEUE: Dict[int, List[types.Message]] = {}  # user_id -> list of videos
-THUMBNAILS: Dict[int, str] = {}  # user_id -> path to current session thumbnail
-PROCESSING: Dict[int, bool] = {}  # user_id -> is processing
+APPROVED_USERS: List[int] = [OWNER_ID]
+VIDEO_QUEUE: Dict[int, List[types.Message]] = {}
+THUMBNAILS: Dict[int, str] = {}
+PROCESSING: Dict[int, bool] = {}
 
-# ------------------ Utils ------------------
+# ------------------ Utilities ------------------
 def owner_only(func):
     @wraps(func)
     async def wrapper(message: types.Message, *args, **kwargs):
@@ -64,15 +61,14 @@ def format_progress_bar(percent: float, length: int = 20) -> str:
     return "[" + "█" * filled + "─" * empty + "]"
 
 # ------------------ Commands ------------------
-
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     await message.reply(
         "👋 Welcome!\n\n"
         "Use /thumb to set your session thumbnail.\n"
         "Send videos (1-99 per session).\n"
-        "When ready, use /done to start processing.\n"
-        "Owner can use /adduser <id|@username> to approve new users."
+        "Use /done to process videos.\n"
+        "Owner can /adduser <id|@username> to approve new users."
     )
 
 @dp.message_handler(commands=["adduser"])
@@ -82,6 +78,7 @@ async def cmd_adduser(message: types.Message):
     if not args:
         await message.reply("Usage: /adduser <id|@username>")
         return
+    added = []
     for arg in args:
         try:
             if arg.startswith("@"):
@@ -91,16 +88,16 @@ async def cmd_adduser(message: types.Message):
                 uid = int(arg)
             if uid not in APPROVED_USERS:
                 APPROVED_USERS.append(uid)
+                added.append(uid)
         except Exception as e:
             await message.reply(f"❌ Failed to add {arg}: {e}")
-            continue
-    await message.reply(f"✅ Approved users: {APPROVED_USERS}")
+    await message.reply(f"✅ Approved users: {APPROVED_USERS}\nAdded: {added}")
 
 @dp.message_handler(commands=["thumb"])
 @approved_only
 async def cmd_thumb(message: types.Message):
     if not message.reply_to_message or not message.reply_to_message.photo:
-        await message.reply("📌 Reply to a photo with /thumb to set it as thumbnail.")
+        await message.reply("📌 Reply to a photo with /thumb to set as session thumbnail.")
         return
     photo = message.reply_to_message.photo[-1]
     file_path = f"thumb_{message.from_user.id}.jpg"
@@ -123,7 +120,6 @@ async def cmd_done(message: types.Message):
     asyncio.create_task(process_videos(user_id, message.chat.id))
 
 # ------------------ Video Handling ------------------
-
 @dp.message_handler(content_types=[types.ContentType.VIDEO])
 @approved_only
 async def handle_video(message: types.Message):
@@ -139,54 +135,42 @@ async def process_videos(user_id: int, chat_id: int):
     processed = 0
     start_time = time.time()
     thumb_path = THUMBNAILS.get(user_id)
+    thumb_file = InputFile(thumb_path) if thumb_path else None
 
     while queue:
         msg = queue.pop(0)
         processed += 1
-        file_id = msg.video.file_id
-        caption = msg.caption or ""
-        file_name = f"video_{user_id}_{int(time.time())}.mp4"
+        percent = processed / total
+        elapsed = time.time() - start_time
+        remaining = total - processed
+        est_time = (elapsed / processed) * remaining if processed else 0
+        progress_bar = format_progress_bar(percent)
 
-        # Download video
-        video_file = await bot.get_file(file_id)
-        await video_file.download(destination_file=file_name)
-
-        # Send video with thumbnail
+        # Send video using file_id with thumbnail
         try:
-            thumb_file = InputFile(thumb_path) if thumb_path else None
             await bot.send_video(
                 chat_id=chat_id,
-                video=InputFile(file_name),
-                caption=caption,
+                video=msg.video.file_id,
+                caption=msg.caption or "",
                 thumb=thumb_file
             )
         except Exception as e:
             logger.error(f"Failed to send video: {e}")
-        finally:
-            # Delete temp video
-            if os.path.exists(file_name):
-                os.remove(file_name)
+            await bot.send_message(chat_id, f"❌ Failed to send video: {e}")
 
-        # Progress calculation
-        elapsed = time.time() - start_time
-        remaining = total - processed
-        est_time = (elapsed / processed) * remaining if processed else 0
-        percent = processed / total
-        progress_bar = format_progress_bar(percent)
-
+        # Send progress update
         await bot.send_message(
             chat_id,
             f"📊 Progress: {progress_bar} {processed}/{total}\n"
             f"⏱ Elapsed: {int(elapsed)}s | ⏳ Remaining: {int(est_time)}s"
         )
 
-    # Session cleanup
+    # Cleanup
     PROCESSING[user_id] = False
     VIDEO_QUEUE[user_id] = []
     await bot.send_message(chat_id, "✅ All videos processed!")
 
-# ------------------ Health check & self-ping ------------------
-
+# ------------------ Health Check / Self-Ping ------------------
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -196,18 +180,14 @@ async def self_ping():
             await bot.get_me()
         except Exception as e:
             logger.warning(f"Self-ping failed: {e}")
-        await asyncio.sleep(60)  # ping every 60s
+        await asyncio.sleep(60)
 
-# ------------------ Webhook ------------------
-
+# ------------------ Webhook Setup ------------------
 async def on_startup(app):
-    # Set webhook
     await bot.set_webhook(WEBHOOK_URL)
-    # Start self-ping task
     app["ping_task"] = asyncio.create_task(self_ping())
 
 async def on_shutdown(app):
-    # Delete webhook
     await bot.delete_webhook()
     app["ping_task"].cancel()
 
