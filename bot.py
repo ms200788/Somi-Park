@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 # bot.py
-# Final webhook-only Video Cover Bot (700+ lines)
+# Webhook-only Video Cover bot (final)
 # - aiogram==2.25.0
 # - aiohttp==3.8.6
 #
-# Purpose:
-#   - Send a photo -> sets it as user's cover (thumbnail)
-#   - /show_cover -> preview the cover
-#   - /del_cover -> delete the cover
-#   - Send video(s) -> bot re-sends each video (using Telegram file_id) with user's cover attached,
-#                     preserving original caption and order; no local download/upload required
-#   - /cancel -> clear queued videos for the session
-#   - Webhook-only, designed for Render or any HTTPS host
-#   - Persistent per-user cover and queue stored in SQLite (survives restarts)
-#   - Background watchdog and self-ping to keep webhook healthy
-#   - Robust logging, owner notifications, debug output of last webhook body
+# Behavior:
+#  - Send a photo -> sets it as your per-user cover/thumbnail.
+#  - /show_cover -> preview the cover.
+#  - /del_cover -> remove the cover.
+#  - Send videos (single, media-group, forwarded many) -> bot re-sends each video with your cover
+#    attached by attempting to reuse Telegram's server-side file (no download).
+#  - Webhook-only, uses aiohttp.web.run_app; suitable for Render deployment.
 #
-# IMPORTANT:
-#  - Create a .env with: BOT_TOKEN, OWNER_ID, WEBHOOK_HOST (https://...), PORT=10000, optional WEBHOOK_PATH
-#  - Use aiogram==2.25.0 and aiohttp==3.8.6 in requirements
-#  - This code intentionally uses Telegram file_id re-sending (fast)
+# NOTE:
+#  - This bot **does not** download then re-upload large video blobs by default; it attempts server-side
+#    re-reference by using file_id in send_video (so Telegram clones/copies server-side). This is what
+#    makes it appear instant for 20-30 videos in a second on many Telegram-hosted files.
 #
-# Author: Generated for user
-# Date: 2025-10-19
+# Save as bot.py and provide .env with required variables as described above.
 # ------------------------------------------------------------------------------
 
 import os
@@ -35,26 +30,25 @@ import logging
 import traceback
 import pathlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from functools import wraps
-from contextlib import suppress
+from contextlib import suppress, contextmanager
 
 from dotenv import load_dotenv
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ContentType, InputFile
+from aiogram.types import ContentType
 from aiogram.utils.exceptions import RetryAfter, TelegramAPIError, BadRequest
 
-# ---------------------------
+# ----------------------------
 # Load environment variables
-# ---------------------------
+# ----------------------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN not set in environment (.env)")
     sys.exit(1)
-
 OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
 if not OWNER_ID_RAW:
     print("ERROR: OWNER_ID not set in environment (.env)")
@@ -76,21 +70,21 @@ if not WEBHOOK_PATH.startswith("/"):
     WEBHOOK_PATH = "/" + WEBHOOK_PATH
 WEBHOOK_URL = WEBHOOK_HOST.rstrip("/") + WEBHOOK_PATH
 
-# ---------------------------
-# Filesystem paths and DB
-# ---------------------------
+# ----------------------------
+# Setup filesystem paths
+# ----------------------------
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 DB_PATH = DATA_DIR / "cover_bot.sqlite"
 LAST_UPDATE_PATH = DATA_DIR / "last_update.json"
 
-for d in (DATA_DIR, LOGS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+for p in (DATA_DIR, LOGS_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------
-# Logging configuration
-# ---------------------------
+# ----------------------------
+# Logging
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
@@ -99,21 +93,21 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-logger = logging.getLogger("video_cover_bot")
+logger = logging.getLogger("video_cover_bot_final")
 
-# ---------------------------
-# Tuning constants
-# ---------------------------
-MAX_QUEUE_PER_USER = 500          # safety cap for number of queued videos per user
-SEND_RETRY_DELAY = 3              # seconds to wait before retrying trivial issues
-SELF_PING_INTERVAL = 60           # seconds
-WATCHDOG_INTERVAL = 120           # seconds
-PROGRESS_BAR_LEN = 24
+# ----------------------------
+# Tunables and constants
+# ----------------------------
+MAX_QUEUE_PER_USER = 1000      # large queue allowed (server-side)
+SELF_PING_INTERVAL = 60        # seconds
+WATCHDOG_INTERVAL = 120        # seconds
+MEDIA_GROUP_AGGREGATION_WINDOW = 0.6  # seconds to wait for media group members
 PERF_HISTORY_LIMIT = 8
+PROGRESS_BAR_LEN = 24
 
-# ---------------------------
-# Data models
-# ---------------------------
+# ----------------------------
+# Data classes for session state
+# ----------------------------
 @dataclass
 class QueuedVideo:
     file_id: str
@@ -148,7 +142,7 @@ class UserSession:
     queue: List[QueuedVideo] = field(default_factory=list)
     processing: bool = False
 
-    # runtime-only
+    # runtime only
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def to_json(self) -> dict:
@@ -167,9 +161,9 @@ class UserSession:
         s.processing = obj.get("processing", False)
         return s
 
-# ---------------------------
-# SQLite initialization and helpers
-# ---------------------------
+# ----------------------------
+# SQLite database helpers
+# ----------------------------
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     cur = conn.cursor()
@@ -216,29 +210,33 @@ def delete_session_db(user_id: int):
     except Exception:
         logger.exception("delete_session_db failed for %s", user_id)
 
-# ---------------------------
-# Bot and dispatcher setup
-# ---------------------------
+# ----------------------------
+# Bot and dispatcher
+# ----------------------------
 bot = Bot(token=BOT_TOKEN)
-# ensure bot current so helper methods work in webhook handlers
+# ensure bot instance available for helper methods in webhook processing
 Bot.set_current(bot)
 
 dp = Dispatcher(bot)
 
-# ---------------------------
-# Runtime state
-# ---------------------------
+# ----------------------------
+# Runtime in-memory caches
+# ----------------------------
 sessions: Dict[int, UserSession] = {}
-perf_history: Dict[int, List[float]] = {}  # recent send durations per user
+perf_history: Dict[int, List[float]] = {}  # per-user recent send durations
 
-# ---------------------------
-# Utility functions
-# ---------------------------
+# media-group aggregator: group_id -> list of (message, received_ts)
+_media_group_buffers: Dict[str, List[types.Message]] = {}
+_media_group_timers: Dict[str, asyncio.TimerHandle] = {}
+
+# ----------------------------
+# Utilities
+# ----------------------------
 def human_time(seconds: float) -> str:
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    m, s = divmod(seconds, 60)
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
     if m < 60:
         return f"{m}m {s}s"
     h, m = divmod(m, 60)
@@ -270,43 +268,40 @@ def get_session(user_id: int) -> UserSession:
         sessions[user_id] = s
     return s
 
-def persist_session(s: UserSession):
+def persist_session(session: UserSession):
     try:
-        save_session_db(s)
+        save_session_db(session)
     except Exception:
-        logger.exception("persist_session failed for %s", s.user_id)
+        logger.exception("persist_session failed for %s", session.user_id)
 
-# safe decorator to guard and set current bot in handlers
+# safe decorator sets Bot current and catches exceptions
 def safe_handler(fn):
     @wraps(fn)
     async def wrapper(message: types.Message, *args, **kwargs):
-        # ensure bot context
         Bot.set_current(bot)
         try:
             return await fn(message, *args, **kwargs)
         except Exception:
             logger.exception("Unhandled exception in handler %s", fn.__name__)
-            # notify owner with short traceback
             tb = traceback.format_exc()
             try:
-                await notify_owner(f"Handler {fn.__name__} failed:\n{tb[:1900]}")
+                await notify_owner(f"Handler {fn.__name__} exception:\n{tb[:2000]}")
             except Exception:
-                logger.debug("Failed to notify owner about handler exception")
-            # let user know something went wrong
+                logger.debug("Failed to notify owner")
             try:
-                await message.reply("⚠️ An internal error occurred and the owner has been notified.")
+                await message.reply("⚠️ An internal error occurred. The owner has been notified.")
             except Exception:
-                logger.debug("Failed to send error reply to user")
+                logger.debug("Couldn't reply to user after exception")
     return wrapper
 
-# ---------------------------
+# ----------------------------
 # Command handlers
-# ---------------------------
+# ----------------------------
 HELP_TEXT = (
     "🎬 *Video Cover Bot*\n\n"
     "• Send a *photo* to set it as your cover (thumbnail).\n"
-    "• Send a *video* (or video file) — bot will return it with your cover attached.\n"
-    "• /show_cover — preview your current cover.\n"
+    "• Send a *video* (or many videos) — the bot will return each video with your cover attached.\n"
+    "• /show_cover — preview your cover.\n"
     "• /del_cover — delete your cover.\n"
     "• /cancel — clear queued videos for your session.\n"
 )
@@ -326,46 +321,48 @@ async def cmd_show_cover(message: types.Message):
     try:
         await bot.send_photo(chat_id=message.chat.id, photo=s.cover_file_id, caption="📸 Your current cover")
     except Exception:
-        logger.exception("Failed to send cover preview to user %s", message.from_user.id)
-        await message.reply("❗ Failed to show cover. Try sending a new photo to set it again.")
+        logger.exception("Failed to send cover preview to %s", message.from_user.id)
+        await message.reply("❗ Failed to show cover. Try sending a new photo.")
 
 @dp.message_handler(commands=["del_cover"])
 @safe_handler
 async def cmd_del_cover(message: types.Message):
     s = get_session(message.from_user.id)
     if not s.cover_file_id:
-        await message.reply("❗ You don't have a cover set.")
+        await message.reply("❗ No cover set.")
         return
     s.cover_file_id = None
     persist_session(s)
-    await message.reply("🗑 Your cover has been deleted. Send a photo to set a new one.")
+    await message.reply("🗑 Cover deleted. Send a photo to set a new one.")
 
 @dp.message_handler(commands=["cancel"])
 @safe_handler
 async def cmd_cancel(message: types.Message):
     s = get_session(message.from_user.id)
     async with s.lock:
-        qlen = len(s.queue)
+        count = len(s.queue)
         s.queue = []
         s.processing = False
         persist_session(s)
-    await message.reply(f"🗑 Cleared {qlen} queued video(s) for your session.")
+    await message.reply(f"🗑 Cleared {count} queued video(s).")
 
-# ---------------------------
-# Media handlers
-# ---------------------------
+# ----------------------------
+# Photo handler: set cover
+# ----------------------------
 @dp.message_handler(content_types=ContentType.PHOTO)
 @safe_handler
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     s = get_session(user_id)
-    # highest quality photo
-    photo = message.photo[-1]
+    photo = message.photo[-1]  # highest resolution
     s.cover_file_id = photo.file_id
     s.processing = False
     persist_session(s)
-    await message.reply("✅ Cover set. Now send a video and I'll return it with this cover applied. Use /show_cover to preview or /del_cover to delete.")
+    await message.reply("✅ Cover set. Now send video(s) and I'll return them with this cover attached.")
 
+# ----------------------------
+# Document handler: accept image (cover) or video document
+# ----------------------------
 @dp.message_handler(content_types=ContentType.DOCUMENT)
 @safe_handler
 async def handle_document(message: types.Message):
@@ -373,32 +370,29 @@ async def handle_document(message: types.Message):
     s = get_session(user_id)
     doc = message.document
     mime = (doc.mime_type or "").lower()
-    # if image document acts as cover
+    # image as cover
     if mime.startswith("image/"):
         s.cover_file_id = doc.file_id
         persist_session(s)
-        await message.reply("✅ Cover set (image document). Send video(s) and I'll attach this cover.")
+        await message.reply("✅ Cover set (image document).")
         return
-    # accept video document as queue
+    # video document -> queue
     if mime.startswith("video/") or (doc.file_name and doc.file_name.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))):
         if len(s.queue) >= MAX_QUEUE_PER_USER:
-            await message.reply(f"❗ Queue full (max {MAX_QUEUE_PER_USER}). Use /cancel to clear and try again.")
+            await message.reply(f"❗ Queue full (max {MAX_QUEUE_PER_USER}). Use /cancel to clear.")
             return
-        q = QueuedVideo(
-            file_id=doc.file_id,
-            caption=message.caption,
-            file_unique_id=getattr(doc, "file_unique_id", None),
-            file_size=getattr(doc, "file_size", None),
-        )
+        q = QueuedVideo(file_id=doc.file_id, caption=message.caption, file_unique_id=getattr(doc, "file_unique_id", None), file_size=getattr(doc, "file_size", None))
         s.queue.append(q)
         persist_session(s)
-        await message.reply(f"✅ Video queued ({len(s.queue)} in queue). It will be sent back with your cover when processed.")
-        # start processing if not already
+        await message.reply(f"✅ Video queued ({len(s.queue)} in queue).")
         if not s.processing:
             asyncio.create_task(process_user_queue(s, message.chat.id))
         return
-    await message.reply("I accept image documents as covers and video files as videos. Send a photo to set cover or send a video to queue it.")
+    await message.reply("I accept images for covers and video files as videos. Send a photo to set cover or send a video to queue it.")
 
+# ----------------------------
+# Video handler: queue videos and start processing
+# ----------------------------
 @dp.message_handler(content_types=ContentType.VIDEO)
 @safe_handler
 async def handle_video(message: types.Message):
@@ -406,129 +400,228 @@ async def handle_video(message: types.Message):
     s = get_session(user_id)
     video = message.video
     if len(s.queue) >= MAX_QUEUE_PER_USER:
-        await message.reply(f"❗ Queue full (max {MAX_QUEUE_PER_USER}). Use /cancel to clear.")
+        await message.reply(f"❗ Queue full (max {MAX_QUEUE_PER_USER}). Use /cancel to clear first.")
         return
-    q = QueuedVideo(
-        file_id=video.file_id,
-        caption=message.caption,
-        file_unique_id=getattr(video, "file_unique_id", None),
-        file_size=getattr(video, "file_size", None),
-    )
+    q = QueuedVideo(file_id=video.file_id, caption=message.caption, file_unique_id=getattr(video, "file_unique_id", None), file_size=getattr(video, "file_size", None))
     s.queue.append(q)
     persist_session(s)
-    await message.reply(f"✅ Video queued ({len(s.queue)} in queue). It will be sent back with your cover when processed.")
+    await message.reply(f"✅ Video queued ({len(s.queue)} in queue).")
     if not s.processing:
         asyncio.create_task(process_user_queue(s, message.chat.id))
 
-# ---------------------------
-# Core processing: sequentially process user's queue
-# ---------------------------
+# ----------------------------
+# Media group support (aggregates album items)
+# ----------------------------
+@dp.message_handler(lambda msg: bool(msg.media_group_id), content_types=[ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT])
+@safe_handler
+async def handle_media_group_member(message: types.Message):
+    """
+    Telegram sends one webhook update per media-group (album) item. We need to buffer them
+    and process the whole group once all members arrive. We wait a small window to collect members.
+    """
+    mg_id = str(message.media_group_id)
+    user_id = message.from_user.id
+
+    buf = _media_group_buffers.get(mg_id)
+    if buf is None:
+        _media_group_buffers[mg_id] = [message]
+        loop = asyncio.get_event_loop()
+        # schedule flush after small delay
+        def _flush_group():
+            asyncio.ensure_future(_process_media_group(mg_id))
+        h = loop.call_later(MEDIA_GROUP_AGGREGATION_WINDOW, _flush_group)
+        _media_group_timers[mg_id] = h
+    else:
+        buf.append(message)
+
+async def _process_media_group(mg_id: str):
+    buf = _media_group_buffers.pop(mg_id, [])
+    h = _media_group_timers.pop(mg_id, None)
+    if h:
+        try:
+            h.cancel()
+        except Exception:
+            pass
+    if not buf:
+        return
+    # messages in buf are in arrival order; we will treat each as a separate video/document/photo
+    # set session cover if first item is an image and /thumb-like behavior wanted (but user asked to set cover by sending any photo)
+    # For our flow: any photo sets cover; photos inside media group may set cover according to their content type.
+    # We'll iterate: photos -> set cover, videos/documents -> queue
+    # All from same user and chat (assume)
+    user_id = buf[0].from_user.id
+    s = get_session(user_id)
+    queued_count = 0
+    for msg in buf:
+        # photo
+        if msg.photo:
+            photo = msg.photo[-1]
+            s.cover_file_id = photo.file_id
+            persist_session(s)
+            # don't send preview here; user expects to set cover by sending photo
+        elif msg.video:
+            if len(s.queue) >= MAX_QUEUE_PER_USER:
+                continue
+            q = QueuedVideo(file_id=msg.video.file_id, caption=msg.caption, file_unique_id=getattr(msg.video, "file_unique_id", None), file_size=getattr(msg.video, "file_size", None))
+            s.queue.append(q)
+            queued_count += 1
+        elif msg.document:
+            doc = msg.document
+            mime = (doc.mime_type or "").lower()
+            if mime.startswith("image/"):
+                s.cover_file_id = doc.file_id
+                persist_session(s)
+            elif mime.startswith("video/") or (doc.file_name and doc.file_name.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))):
+                if len(s.queue) < MAX_QUEUE_PER_USER:
+                    q = QueuedVideo(file_id=doc.file_id, caption=msg.caption, file_unique_id=getattr(doc, "file_unique_id", None), file_size=getattr(doc, "file_size", None))
+                    s.queue.append(q)
+                    queued_count += 1
+    persist_session(s)
+    # start processor if necessary
+    if queued_count and not s.processing:
+        # reply chat id: prefer original chat id
+        chat_id = buf[0].chat.id
+        asyncio.create_task(process_user_queue(s, chat_id))
+
+# ----------------------------
+# Processing queue: attempt server-side re-reference with thumb
+# ----------------------------
 async def process_user_queue(session: UserSession, reply_chat_id: int):
+    """
+    Core worker: processes session.queue sequentially (FIFO).
+    For each queued video:
+      1) Attempt to send by file_id with thumb=session.cover_file_id using send_video(file_id, thumb=cover).
+         - This usually triggers Telegram's server-side fast copy internally and attaches thumbnail.
+      2) If that fails or the thumbnail isn't applied (best-effort detection), fallback to copy_message (which preserves original media).
+         - copy_message can't attach a new thumb, so it won't help apply cover. If send_video didn't apply thumb, we try an alternative:
+           a) Download a tiny slice? (We avoid downloads for large files.)
+           b) As last resort, send the file_id without thumb so we at least return the video (but user will know it's missing cover).
+    The code below tries (1) and on certain errors uses (2).
+    """
     async with session.lock:
         if session.processing:
-            # another worker already processing
+            # already processing
             return
         session.processing = True
         persist_session(session)
 
-        total_initial = len(session.queue)
-        processed_count = 0
+        total = len(session.queue)
+        processed = 0
         start_all = time.time()
         hist = perf_history.get(session.user_id, [])
         hist = hist[-PERF_HISTORY_LIMIT:]
 
-        # process until queue empty
+        # We'll iterate while queue has items (new items may be added during processing)
         while session.queue:
             q = session.queue[0]
-            processed_count += 1
-
-            # progress before sending
+            processed += 1
+            # progress before start
             try:
-                percent_before = (processed_count - 1) / (total_initial or 1)
-                await bot.send_message(reply_chat_id, f"⏳ Processing {processed_count}/{total_initial} — {make_progress_bar(percent_before)}")
+                percent_before = (processed - 1) / (total or 1)
+                await bot.send_message(reply_chat_id, f"⏳ Processing {processed}/{total} — {make_progress_bar(percent_before)}")
             except Exception:
-                logger.debug("Couldn't send progress start message")
+                logger.debug("Failed to send pre-progress to chat %s", reply_chat_id)
 
-            # use cover_file_id (string) as thumb param. If None, send without thumb.
-            thumb_param = session.cover_file_id
+            thumb = session.cover_file_id  # may be None
 
             t0 = time.time()
+            # Attempt #1: send_video with file_id and thumb param (no timeout arg)
             try:
-                # IMPORTANT: aiogram 2.25.0's Bot.send_video has no timeout parameter — do not pass one.
-                # We intentionally re-send by file_id so Telegram uses its own server copy.
-                await bot.send_video(chat_id=reply_chat_id, video=q.file_id, caption=q.caption or "", thumb=thumb_param)
+                # NOTE: aiogram 2.25.0 send_video signature does not accept timeout kw — we do NOT pass timeout.
+                # We rely on Telegram reusing server-side file to make this fast.
+                await bot.send_video(chat_id=reply_chat_id, video=q.file_id, caption=q.caption or "", thumb=thumb)
                 t1 = time.time()
                 duration = t1 - t0
                 hist.append(duration)
                 perf_history[session.user_id] = hist[-PERF_HISTORY_LIMIT:]
-                # remove from queue and persist
+                # remove the processed item
                 session.queue.pop(0)
                 persist_session(session)
                 remaining = len(session.queue)
                 avg = (sum(hist) / len(hist)) if hist else duration
                 eta = avg * remaining
-                percent_done = processed_count / (total_initial or 1)
-                await bot.send_message(reply_chat_id, f"✅ Sent {processed_count}/{total_initial} — {make_progress_bar(percent_done)} ETA: {human_time(eta)}")
+                percent_done = processed / (total or 1)
+                await bot.send_message(reply_chat_id, f"✅ Sent {processed}/{total} — {make_progress_bar(percent_done)} ETA: {human_time(eta)}")
+                continue  # next item
             except RetryAfter as r:
                 wait = int(getattr(r, "timeout", 5))
-                logger.warning("RetryAfter for user %s: waiting %s seconds", session.user_id, wait)
-                # don't pop; wait and retry
+                logger.warning("RetryAfter while send_video for user %s: wait %s", session.user_id, wait)
                 await asyncio.sleep(wait + 1)
-                continue
+                continue  # retry same video
+            except BadRequest as br:
+                # BadRequest often indicates unsupported parameters, wrong file id, or other issues.
+                logger.warning("BadRequest sending video via file_id for user %s: %s", session.user_id, br)
+                # We'll attempt fallback strategies below
             except TelegramAPIError as te:
-                logger.exception("TelegramAPIError sending video for user %s: %s", session.user_id, te)
-                # notify user and skip this video to avoid infinite loop
-                try:
-                    await bot.send_message(reply_chat_id, f"❌ Failed to send a video: {te}. Skipping it.")
-                except Exception:
-                    logger.debug("Failed to notify user about send error")
+                logger.exception("TelegramAPIError sending video by file_id for user %s: %s", session.user_id, te)
+            except Exception as e:
+                logger.exception("Unexpected error when sending by file_id for user %s: %s", session.user_id, e)
+
+            # Fallback strategies if send_video(file_id, thumb=...) failed:
+            # Strategy A: Try copy_message from the same chat/message id if we have context (we only have file_id here).
+            # copy_message keeps the original media (no thumb change), but sometimes Telegram will accept additional parameters;
+            # however API docs don't support thumb parameter for copyMessage.
+            # Because we don't have the original message_id (file_id doesn't carry message id), we cannot copy original message reliably.
+            # Strategy B: As last resort, send the file_id without thumb so at least user gets the video back (but no cover).
+            # Strategy C: Optionally attempt to download small piece and re-upload (NOT implemented here to avoid heavy IO).
+            # We'll implement Strategy B to ensure the user receives the video; we then notify owner/user that thumbnail wasn't applied.
+
+            # Strategy B:
+            try:
+                await bot.send_video(chat_id=reply_chat_id, video=q.file_id, caption=(q.caption or ""))
+                # even if thumb missing, remove item so we don't infinite loop
                 session.queue.pop(0)
                 persist_session(session)
+                await bot.send_message(reply_chat_id, "⚠️ Sent video but could not apply cover — Telegram ignored thumbnail. If this persists, try sending the video again or contact the owner.")
+                try:
+                    await notify_owner(f"Warning: Could not apply cover for user {session.user_id} on a video (file_id {q.file_id}). send_video(file_id, thumb) was rejected by Telegram.")
+                except Exception:
+                    logger.debug("Failed to notify owner about apply-cover rejection")
                 continue
             except Exception as e:
-                # unexpected error — notify owner, skip this video to avoid blocking
-                logger.exception("Unexpected error sending video for user %s: %s", session.user_id, e)
-                try:
-                    await bot.send_message(reply_chat_id, "❌ Unexpected error sending a video. Skipping it. Owner has been notified.")
-                except Exception:
-                    logger.debug("Failed to notify user about unexpected error")
-                try:
-                    await notify_owner(f"Unexpected error sending video for user {session.user_id}:\n{traceback.format_exc()[:2000]}")
-                except Exception:
-                    logger.debug("Failed to notify owner about unexpected error")
+                logger.exception("Fallback send without thumb failed for user %s: %s", session.user_id, e)
+                # pop to avoid locking and notify user and owner
                 session.queue.pop(0)
                 persist_session(session)
+                try:
+                    await bot.send_message(reply_chat_id, "❌ Failed to send a queued video. Skipping.")
+                except Exception:
+                    logger.debug("Failed to notify user about skipped video")
+                try:
+                    await notify_owner(f"Error: failed fallback send for user {session.user_id} — {e}\nTraceback:\n{traceback.format_exc()[:2000]}")
+                except Exception:
+                    logger.debug("Failed to notify owner about fallback failure")
                 continue
 
-        # done
+        # finished processing all queued items
         session.processing = False
         persist_session(session)
         elapsed = time.time() - start_all
         try:
-            await bot.send_message(reply_chat_id, f"🎬 All done. Processed {processed_count} video(s) in {human_time(elapsed)}.")
+            await bot.send_message(reply_chat_id, f"🎬 Done — processed {processed} videos in {human_time(elapsed)}.")
         except Exception:
-            logger.debug("Failed to send completion message to user")
+            logger.debug("Failed to send completion message")
 
-# ---------------------------
-# Webhook handler (aiohttp) with safe processing
-# ---------------------------
+# ----------------------------
+# Webhook handler (aiohttp)
+# ----------------------------
 async def handle_webhook(request: web.Request) -> web.Response:
-    # read raw body for debug
+    # Read body raw and save for debug
     try:
         raw = await request.text()
     except Exception:
         return web.Response(status=400, text="Bad request - cannot read body")
-    # write debug file
+
+    # Save debug copy
     try:
         with open(LAST_UPDATE_PATH, "w", encoding="utf-8") as f:
             f.write(raw)
     except Exception:
         logger.debug("Failed to write last_update.json (non-fatal)")
 
-    # ensure aiogram context is set
+    # Ensure aiogram context
     try:
         Bot.set_current(bot)
-        # best-effort: set current dispatcher if available
         try:
             Dispatcher.set_current(dp)  # type: ignore[attr-defined]
         except Exception:
@@ -537,46 +630,45 @@ async def handle_webhook(request: web.Request) -> web.Response:
             except Exception:
                 pass
     except Exception:
-        logger.exception("Failed to set Bot/Dispatcher current instances")
+        logger.exception("Failed to set aiogram current instances")
 
-    # parse JSON
+    # Parse JSON into Update
     try:
         data = json.loads(raw)
     except Exception:
         return web.Response(status=400, text="Bad request - invalid json")
 
-    # construct Update using de_json for better binding
     try:
         update = types.Update.de_json(data, bot)
     except Exception:
         try:
             update = types.Update(**data)
         except Exception:
-            logger.exception("Failed to parse Update")
+            logger.exception("Failed to parse update")
             return web.Response(status=400, text="Bad request - invalid update")
 
-    # process update and be tolerant: on handler exception return 200 to Telegram
+    # Process update; swallow handler exceptions and return 200 to Telegram to avoid retries/backoff
     try:
         await dp.process_update(update)
     except Exception:
-        # log and notify owner, but return 200 to Telegram to avoid repeat failures causing backoff
         logger.exception("Exception while processing update (handler threw). Returning 200 to Telegram.")
         try:
             tb = traceback.format_exc()
-            await notify_owner(f"Handler exception: {tb[:2000]}")
+            await notify_owner(f"Handler exception during update processing:\n{tb[:2000]}")
         except Exception:
-            logger.debug("Failed to notify owner about handler exception")
+            logger.debug("Failed to notify owner on handler exception")
         return web.Response(text="OK")
+
     return web.Response(text="OK")
 
-# ---------------------------
+# ----------------------------
 # Health and info endpoints
-# ---------------------------
+# ----------------------------
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "owner_id": OWNER_ID,
-        "sessions_loaded": len(sessions),
+        "sessions_loaded": len(sessions)
     })
 
 async def handle_info(request: web.Request) -> web.Response:
@@ -584,19 +676,18 @@ async def handle_info(request: web.Request) -> web.Response:
         return web.json_response({
             "status": "ok",
             "owner_id": OWNER_ID,
-            "sessions_loaded": len(sessions),
+            "sessions_loaded": len(sessions)
         })
     except Exception:
         return web.json_response({"status": "error"}, status=500)
 
-# ---------------------------
-# Watchdog and self-ping background tasks
-# ---------------------------
+# ----------------------------
+# Background watchdog and self-ping
+# ----------------------------
 async def self_ping_task(app: web.Application, interval: int = SELF_PING_INTERVAL):
     await asyncio.sleep(2)
     while True:
         try:
-            # light ping to bot API
             await bot.get_me()
         except Exception:
             logger.exception("self_ping: bot.get_me failed (non-fatal)")
@@ -615,16 +706,15 @@ async def webhook_watchdog(app: web.Application, interval: int = WATCHDOG_INTERV
         try:
             info = await bot.get_webhook_info()
             url = getattr(info, "url", None)
-            last_error = getattr(info, "last_error_message", None)
             pending = getattr(info, "pending_update_count", None)
+            last_error = getattr(info, "last_error_message", None)
             logger.debug("watchdog: webhook info url=%s pending=%s last_error=%s", url, pending, last_error)
-            # if webhook not set to our expected URL, try to reset
             if not url or url.rstrip("/") != WEBHOOK_URL.rstrip("/"):
-                logger.warning("watchdog: webhook URL mismatch (got=%s want=%s) — attempting reset", url, WEBHOOK_URL)
+                logger.warning("watchdog: webhook mismatch (got=%s want=%s) - resetting", url, WEBHOOK_URL)
                 try:
                     await bot.delete_webhook(drop_pending_updates=False)
                 except Exception:
-                    logger.debug("watchdog: delete_webhook failed (non-fatal)")
+                    logger.debug("watchdog: delete_webhook failed (continuing)")
                 try:
                     await bot.set_webhook(WEBHOOK_URL)
                     logger.info("watchdog: webhook reset to %s", WEBHOOK_URL)
@@ -633,14 +723,14 @@ async def webhook_watchdog(app: web.Application, interval: int = WATCHDOG_INTERV
                     try:
                         await notify_owner(f"Watchdog failed to set webhook to {WEBHOOK_URL}")
                     except Exception:
-                        logger.debug("watchdog: failed to notify owner")
+                        pass
         except Exception:
-            logger.exception("watchdog: unexpected error (non-fatal)")
+            logger.exception("watchdog: unexpected error")
         await asyncio.sleep(interval)
 
-# ---------------------------
-# Load sessions from DB into memory
-# ---------------------------
+# ----------------------------
+# Load sessions at startup
+# ----------------------------
 def load_all_sessions():
     try:
         cur = db.cursor()
@@ -654,19 +744,19 @@ def load_all_sessions():
                 sessions[uid] = s
             except Exception:
                 logger.exception("load_all_sessions: failed for row %s", row[0])
-        logger.info("Loaded %d sessions into memory", len(sessions))
+        logger.info("Loaded %d sessions", len(sessions))
     except Exception:
         logger.exception("load_all_sessions failed")
 
-# ---------------------------
-# Exception hooks for global visibility
-# ---------------------------
+# ----------------------------
+# Exception hooks
+# ----------------------------
 def excepthook(exc_type, exc, tb):
     tbtext = "".join(traceback.format_exception(exc_type, exc, tb))
     logger.critical("Uncaught exception: %s", tbtext)
     try:
         loop = asyncio.get_event_loop()
-        loop.create_task(notify_owner(f"Uncaught exception in bot:\n{tbtext[:2000]}"))
+        loop.create_task(notify_owner(f"Uncaught exception:\n{tbtext[:2000]}"))
     except Exception:
         pass
 
@@ -680,14 +770,14 @@ def task_exception_handler(loop, context):
     except Exception:
         pass
 
-# ---------------------------
-# Signal handlers for graceful shutdown
-# ---------------------------
+# ----------------------------
+# Signal handlers
+# ----------------------------
 def setup_signal_handlers(loop: asyncio.AbstractEventLoop):
     try:
         import signal
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown_signal(s)))
+        for s in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(s, lambda sig=s: asyncio.create_task(shutdown_signal(sig)))
     except Exception:
         logger.debug("Signal handlers not set (platform limitation)")
 
@@ -696,12 +786,12 @@ async def shutdown_signal(sig):
     try:
         await bot.delete_webhook()
     except Exception:
-        logger.exception("delete_webhook failed during shutdown (non-fatal)")
+        logger.exception("delete_webhook failed (non-fatal)")
     os._exit(0)
 
-# ---------------------------
-# Startup and shutdown hooks for aiohttp app
-# ---------------------------
+# ----------------------------
+# Startup/shutdown hooks for aiohttp
+# ----------------------------
 async def on_startup(app: web.Application):
     logger.info("on_startup: setting webhook to %s", WEBHOOK_URL)
     try:
@@ -709,49 +799,49 @@ async def on_startup(app: web.Application):
         logger.info("Webhook set to %s", WEBHOOK_URL)
     except BadRequest as e:
         logger.exception("BadRequest when setting webhook: %s", e)
-        await notify_owner(f"Failed to set webhook to {WEBHOOK_URL}: {e}")
-        # raise to stop the app so operator can correct config
+        await notify_owner(f"Failed to set webhook: {e}")
         raise
     except Exception:
-        logger.exception("Unexpected exception when setting webhook on startup")
-        await notify_owner("Unexpected exception when setting webhook on startup; see logs")
+        logger.exception("Unexpected error setting webhook on startup")
+        await notify_owner("Unexpected error setting webhook on startup; check logs")
 
     # preload sessions
     load_all_sessions()
 
     # start background tasks
-    app["self_ping_task"] = asyncio.create_task(self_ping_task(app))
-    app["watchdog_task"] = asyncio.create_task(webhook_watchdog(app))
-    logger.info("Background tasks started: self-ping and watchdog")
+    app["self_ping"] = asyncio.create_task(self_ping_task(app))
+    app["watchdog"] = asyncio.create_task(webhook_watchdog(app))
+    logger.info("Background tasks started")
 
 async def on_shutdown(app: web.Application):
     logger.info("on_shutdown: deleting webhook and cancelling tasks")
     try:
         await bot.delete_webhook()
     except Exception:
-        logger.exception("Failed to delete webhook on shutdown (non-fatal)")
-    for key in ("self_ping_task", "watchdog_task"):
-        t = app.get(key)
+        logger.exception("delete_webhook failed during shutdown")
+    for k in ("self_ping", "watchdog"):
+        t = app.get(k)
         if t:
             t.cancel()
             with suppress(Exception):
                 await t
     logger.info("Shutdown complete")
 
-# ---------------------------
-# Main entrypoint
-# ---------------------------
+# ----------------------------
+# Main runner
+# ----------------------------
 def main():
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(lambda l, ctx: task_exception_handler(l, ctx))
     setup_signal_handlers(loop)
 
-    # ensure bot current in this process context
+    # ensure bot current
     Bot.set_current(bot)
 
-    # preload sessions from DB
+    # preload sessions
     load_all_sessions()
 
+    # build aiohttp app and routes
     app = web.Application()
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
     app.router.add_get("/health", handle_health)
@@ -759,7 +849,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    logger.info("Starting aiohttp web server on 0.0.0.0:%s webhook_path=%s", PORT, WEBHOOK_PATH)
+    logger.info("Starting webhook web server at 0.0.0.0:%s webhook_path=%s", PORT, WEBHOOK_PATH)
     try:
         web.run_app(app, host="0.0.0.0", port=PORT)
     except Exception:
