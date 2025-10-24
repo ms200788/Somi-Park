@@ -66,7 +66,7 @@ except Exception:
     print("ERROR: OWNER_ID must be numeric")
     sys.exit(1)
 
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").strip()
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://masked-y5l6.onrender.com ").strip()
 if not WEBHOOK_HOST:
     print("ERROR: WEBHOOK_HOST not set in .env (must be public https url)")
     sys.exit(1)
